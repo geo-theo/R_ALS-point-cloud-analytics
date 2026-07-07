@@ -52,9 +52,11 @@ usage <- function() {
       "",
       "Usage:",
       "  Rscript basic_lidar_analytics.R [input_las_or_laz] [output_dir] [options]",
+      "  Rscript basic_lidar_analytics.R --quick-test",
       "",
       "Options:",
       "  --help                    Show this help message.",
+      "  --quick-test              Run a small sample crop and write outputs/quick_test.",
       "  --no-write-cleaned        Skip writing the cleaned/preprocessed LAS/LAZ.",
       "  --add-hag                 Add height above ground (HAG) if ground points exist.",
       "  --drop-overlap            Drop LAS 1.4 overlap-flagged points when present.",
@@ -82,7 +84,8 @@ parse_args <- function(args) {
     write_cleaned_laz = TRUE,
     add_hag = FALSE,
     drop_overlap = FALSE,
-    z_trim = NULL
+    z_trim = NULL,
+    quick_test = FALSE
   )
 
   positional <- character()
@@ -91,6 +94,8 @@ parse_args <- function(args) {
     if (arg %in% c("--help", "-h")) {
       usage()
       quit(save = "no", status = 0)
+    } else if (arg == "--quick-test") {
+      config$quick_test <- TRUE
     } else if (arg == "--no-write-cleaned") {
       config$write_cleaned_laz <- FALSE
     } else if (arg == "--add-hag") {
@@ -127,6 +132,12 @@ parse_args <- function(args) {
 
   if (length(positional) >= 2) {
     config$output_dir <- positional[[2]]
+  }
+
+  if (isTRUE(config$quick_test)) {
+    config$output_dir <- file.path(script_dir, "outputs", "quick_test")
+    config$read_filter <- quick_test_filter
+    config$write_cleaned_laz <- FALSE
   }
 
   config$input_file <- normalizePath(config$input_file, mustWork = FALSE)
@@ -312,6 +323,29 @@ format_measure <- function(x, digits = 3) {
   }
 
   format(round(as.numeric(x), digits), big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+format_duration <- function(start_time) {
+  elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+  if (elapsed < 60) {
+    return(paste0(round(elapsed, 1), " seconds"))
+  }
+
+  paste0(round(elapsed / 60, 1), " minutes")
+}
+
+format_bool <- function(x) {
+  if (isTRUE(x)) {
+    return("yes")
+  }
+
+  "no"
+}
+
+message_step <- function(text) {
+  message("")
+  message(text)
 }
 
 summary_value <- function(overall_summary, metric) {
@@ -1282,6 +1316,7 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
 
   generated_files <- character()
 
+  message("Writing summary CSV files.")
   generated_files <- c(
     generated_files,
     write_table(
@@ -1329,11 +1364,13 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
   raw_check_path <- file.path(config$output_dir, "las_check_raw.txt")
   clean_check_path <- file.path(config$output_dir, "las_check_cleaned.txt")
 
+  message("Writing LAS QA check reports.")
   writeLines(raw_check, raw_check_path)
   writeLines(clean_check, clean_check_path)
 
   generated_files <- c(generated_files, raw_check_path, clean_check_path)
 
+  message("Creating PNG plots.")
   plot_manifest <- write_report_plots(
     las,
     summaries,
@@ -1346,6 +1383,7 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
   }
 
   if (isTRUE(config$write_cleaned_laz)) {
+    message("Writing cleaned LAZ file and spatial index.")
     input_ext <- tools::file_ext(config$input_file)
     output_ext <- if (nzchar(input_ext)) paste0(".", input_ext) else ".laz"
     output_name <- paste0(
@@ -1362,11 +1400,14 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
     if (file.exists(index_path)) {
       generated_files <- c(generated_files, index_path)
     }
+  } else {
+    message("Skipping cleaned LAZ write because write_cleaned_laz is FALSE.")
   }
 
   report_path <- file.path(config$output_dir, "report.html")
   generated_files_path <- file.path(config$output_dir, "generated_files.txt")
 
+  message("Writing HTML report.")
   report_path <- write_html_report(
     report_path,
     plot_manifest,
@@ -1383,18 +1424,30 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
 }
 
 run_lidar_analytics <- function(config) {
+  start_time <- Sys.time()
+
   if (!file.exists(config$input_file)) {
     stop("Input file does not exist: ", config$input_file, call. = FALSE)
   }
 
   dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)
 
-  message("Reading LAS/LAZ: ", config$input_file)
+  message_step("Starting LiDAR point cloud analytics.")
+  message("Input file: ", config$input_file)
+  message("Output folder: ", config$output_dir)
+  message("Quick test mode: ", format_bool(config$quick_test))
+  message("Write cleaned LAZ: ", format_bool(config$write_cleaned_laz))
   if (nzchar(config$read_filter)) {
-    message("Using read filter: ", config$read_filter)
+    message("Read filter: ", config$read_filter)
+  } else {
+    message("Read filter: none")
   }
 
+  message_step("Reading LAS/LAZ header and points.")
   raw_header <- rlas::read.lasheader(config$input_file)
+  header_count <- read_header_value(raw_header, "Number of point records")
+  message("Header point count: ", format_count(as.numeric(header_count)))
+
   las <- lidR::readLAS(config$input_file, filter = config$read_filter)
 
   if (is.null(las) || point_count(las) == 0) {
@@ -1402,21 +1455,45 @@ run_lidar_analytics <- function(config) {
   }
 
   raw_point_count <- point_count(las)
+  message("Loaded point count: ", format_count(raw_point_count))
 
-  message("Running raw LAS QA check.")
+  message_step("Running raw LAS QA check.")
   raw_check <- capture_las_check(las)
 
-  message("Cleaning/preprocessing point cloud.")
+  message_step("Cleaning/preprocessing point cloud.")
   preprocess_result <- preprocess_las(las, config)
   clean_las <- preprocess_result$las
+  clean_point_count <- point_count(clean_las)
+  total_removed <- raw_point_count - clean_point_count
+  message("Cleaning complete.")
+  message("Retained points: ", format_count(clean_point_count))
+  message("Removed points: ", format_count(total_removed))
 
-  message("Running cleaned LAS QA check.")
+  removed_steps <- preprocess_result$preprocess_log[
+    points_removed > 0,
+    list(step, points_removed)
+  ]
+  if (nrow(removed_steps) > 0) {
+    for (i in seq_len(nrow(removed_steps))) {
+      message(
+        "  - ",
+        gsub("_", " ", removed_steps$step[[i]], fixed = TRUE),
+        ": ",
+        format_count(removed_steps$points_removed[[i]])
+      )
+    }
+  } else {
+    message("  - No points were removed by preprocessing.")
+  }
+
+  message_step("Running cleaned LAS QA check.")
   clean_check <- capture_las_check(clean_las)
 
-  message("Building summary tables.")
+  message_step("Building summary tables.")
   summaries <- build_summaries(clean_las, raw_header, raw_point_count, config)
+  message("Summary tables ready.")
 
-  message("Writing outputs.")
+  message_step("Writing outputs.")
   generated_files <- write_outputs(
     clean_las,
     raw_check,
@@ -1426,10 +1503,25 @@ run_lidar_analytics <- function(config) {
     config
   )
 
-  message("Done. Generated files:")
-  for (path in generated_files) {
-    message("  - ", path)
+  report_path <- generated_files[basename(generated_files) == "report.html"]
+  if (length(report_path) == 0) {
+    report_path <- file.path(config$output_dir, "report.html")
+  } else {
+    report_path <- report_path[[1]]
   }
+
+  generated_files_path <- generated_files[basename(generated_files) == "generated_files.txt"]
+  if (length(generated_files_path) == 0) {
+    generated_files_path <- file.path(config$output_dir, "generated_files.txt")
+  } else {
+    generated_files_path <- generated_files_path[[1]]
+  }
+
+  message_step("Done.")
+  message("Runtime: ", format_duration(start_time))
+  message("Generated file count: ", length(generated_files))
+  message("Open this first: ", report_path)
+  message("Full output list: ", generated_files_path)
 
   invisible(generated_files)
 }
@@ -1437,7 +1529,20 @@ run_lidar_analytics <- function(config) {
 run_default_lidar_analytics <- function(...) {
   config <- parse_args(character())
 
-  overrides <- list(...)
+  config <- apply_config_overrides(config, list(...))
+
+  run_lidar_analytics(config)
+}
+
+run_quick_test <- function(...) {
+  config <- parse_args("--quick-test")
+
+  config <- apply_config_overrides(config, list(...))
+
+  run_lidar_analytics(config)
+}
+
+apply_config_overrides <- function(config, overrides) {
   for (name in names(overrides)) {
     if (!name %in% names(config)) {
       stop("Unknown config option: ", name, call. = FALSE)
@@ -1446,7 +1551,15 @@ run_default_lidar_analytics <- function(...) {
     config[[name]] <- overrides[[name]]
   }
 
-  run_lidar_analytics(config)
+  if ("input_file" %in% names(overrides)) {
+    config$input_file <- normalizePath(config$input_file, mustWork = FALSE)
+  }
+
+  if ("output_dir" %in% names(overrides)) {
+    config$output_dir <- normalizePath(config$output_dir, mustWork = FALSE)
+  }
+
+  config
 }
 
 if (sys.nframe() == 0) {
