@@ -2,12 +2,14 @@
 #
 # Command line usage:
 #   Rscript basic_lidar_analytics.R
+#   Rscript basic_lidar_analytics.R --quick-test
 #   Rscript basic_lidar_analytics.R path/to/input.laz path/to/output_dir
 #   Rscript basic_lidar_analytics.R input.laz outputs/test --add-hag
 #   Rscript basic_lidar_analytics.R input.laz outputs/test --read-filter="-keep_xy xmin ymin xmax ymax"
 #
 # RStudio Console usage:
 #   source("basic_lidar_analytics.R")
+#   run_quick_test()
 #   run_default_lidar_analytics()
 #
 # Required packages:
@@ -31,6 +33,8 @@ if (length(missing_packages) > 0) {
 }
 
 suppressPackageStartupMessages(library(lidR))
+
+quick_test_filter <- "-keep_xy 451350 4497900 451550 4498100"
 
 get_script_dir <- function() {
   file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
