@@ -33,6 +33,7 @@ if (length(missing_packages) > 0) {
 }
 
 suppressPackageStartupMessages(library(lidR))
+options(lidR.progress = FALSE)
 
 quick_test_filter <- "-keep_xy 451350 4497900 451550 4498100"
 
@@ -1448,7 +1449,10 @@ run_lidar_analytics <- function(config) {
   header_count <- read_header_value(raw_header, "Number of point records")
   message("Header point count: ", format_count(as.numeric(header_count)))
 
-  las <- lidR::readLAS(config$input_file, filter = config$read_filter)
+  utils::capture.output(
+    las <- lidR::readLAS(config$input_file, filter = config$read_filter),
+    type = "output"
+  )
 
   if (is.null(las) || point_count(las) == 0) {
     stop("No points were loaded from the input file.", call. = FALSE)
