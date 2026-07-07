@@ -18,6 +18,14 @@ outputs/.../report.html
 
 The HTML report brings the key metrics, plots, summary tables, and file links into one place so you do not have to inspect every CSV manually.
 
+The report also links to:
+
+```text
+point_cloud_3d.html
+```
+
+That file is a sampled interactive 3D point cloud viewer. Drag to rotate, use the mouse wheel to zoom, and switch colors by elevation, classification, or intensity when those fields are available.
+
 ## Install R Packages
 
 The script requires:
@@ -89,6 +97,7 @@ For the full run:
 ## Main Outputs
 
 - `report.html`: automatic summary report with plots and tables.
+- `point_cloud_3d.html`: sampled interactive 3D point cloud viewer.
 - `plots/`: PNG charts used by the report.
 - `overall_summary.csv`: run settings, CRS, point counts, extent, elevation range, and density.
 - `preprocessing_log.csv`: cleaning steps and how many points each step removed.
@@ -126,6 +135,14 @@ Add height above ground if ground points are available:
 ```powershell
 Rscript basic_lidar_analytics.R input.laz outputs/with_hag --add-hag
 ```
+
+Change the 3D viewer sample cap:
+
+```powershell
+Rscript basic_lidar_analytics.R --quick-test --max-3d-points=100000
+```
+
+Higher values show more detail but make `point_cloud_3d.html` larger and may slow down the browser.
 
 ## Notes
 

@@ -62,6 +62,7 @@ usage <- function() {
       "  --add-hag                 Add height above ground (HAG) if ground points exist.",
       "  --drop-overlap            Drop LAS 1.4 overlap-flagged points when present.",
       "  --read-filter=FILTER      Pass a LASlib filter string to lidR::readLAS().",
+      "  --max-3d-points=N         Maximum sampled points in point_cloud_3d.html.",
       "  --z-trim=LOW,HIGH         Optional quantile trim on Z, e.g. 0.001,0.999.",
       "",
       "Default input:",
@@ -86,7 +87,8 @@ parse_args <- function(args) {
     add_hag = FALSE,
     drop_overlap = FALSE,
     z_trim = NULL,
-    quick_test = FALSE
+    quick_test = FALSE,
+    max_3d_points = 75000L
   )
 
   positional <- character()
@@ -105,6 +107,14 @@ parse_args <- function(args) {
       config$drop_overlap <- TRUE
     } else if (startsWith(arg, "--read-filter=")) {
       config$read_filter <- sub("^--read-filter=", "", arg)
+    } else if (startsWith(arg, "--max-3d-points=")) {
+      max_3d_points <- as.integer(sub("^--max-3d-points=", "", arg))
+
+      if (is.na(max_3d_points) || max_3d_points < 1000) {
+        stop("--max-3d-points must be an integer of at least 1000.", call. = FALSE)
+      }
+
+      config$max_3d_points <- max_3d_points
     } else if (startsWith(arg, "--z-trim=")) {
       trim_value <- sub("^--z-trim=", "", arg)
       trim_parts <- as.numeric(strsplit(trim_value, ",", fixed = TRUE)[[1]])
@@ -497,6 +507,216 @@ add_plot_manifest_row <- function(manifest, path, title, description) {
     ),
     use.names = TRUE
   )
+}
+
+js_escape_string <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- gsub("\\", "\\\\", x, fixed = TRUE)
+  x <- gsub('"', '\\"', x, fixed = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  x <- gsub("\n", "\\n", x, fixed = TRUE)
+  paste0('"', x, '"')
+}
+
+js_numeric_array <- function(x, digits = 5L, values_per_line = 16L) {
+  values <- ifelse(
+    is.na(x),
+    "NaN",
+    format(round(as.numeric(x), digits), scientific = FALSE, trim = TRUE)
+  )
+
+  groups <- split(values, ceiling(seq_along(values) / values_per_line))
+  lines <- vapply(groups, paste, character(1), collapse = ",")
+  paste0("[\n", paste(lines, collapse = ",\n"), "\n]")
+}
+
+js_integer_array <- function(x, values_per_line = 24L) {
+  values <- ifelse(is.na(x), "0", as.character(as.integer(x)))
+  groups <- split(values, ceiling(seq_along(values) / values_per_line))
+  lines <- vapply(groups, paste, character(1), collapse = ",")
+  paste0("[\n", paste(lines, collapse = ",\n"), "\n]")
+}
+
+classification_labels_js <- function(classes) {
+  if (is.null(classes) || length(classes) == 0) {
+    return("{}")
+  }
+
+  classes <- sort(unique(as.integer(classes)))
+  entries <- vapply(
+    classes,
+    function(class_id) {
+      label <- class_lookup[[as.character(class_id)]]
+      if (is.null(label) || is.na(label)) {
+        label <- "Unknown or user-defined"
+      }
+
+      paste0('"', class_id, '":', js_escape_string(paste0(class_id, ": ", label)))
+    },
+    character(1)
+  )
+
+  paste0("{", paste(entries, collapse = ","), "}")
+}
+
+write_interactive_3d_viewer <- function(las, config) {
+  dt <- las@data
+
+  if (!all(c("X", "Y", "Z") %in% names(dt)) || nrow(dt) == 0) {
+    warning("Could not create 3D viewer because X, Y, or Z data is missing.", call. = FALSE)
+    return(NULL)
+  }
+
+  viewer_path <- file.path(config$output_dir, "point_cloud_3d.html")
+  sample_cap <- min(as.integer(config$max_3d_points), nrow(dt))
+  idx <- sample_indices(nrow(dt), sample_cap, seed = 45L)
+  sampled <- dt[idx]
+
+  xmin <- safe_min(dt$X)
+  xmax <- safe_max(dt$X)
+  ymin <- safe_min(dt$Y)
+  ymax <- safe_max(dt$Y)
+  zmin <- safe_min(dt$Z)
+  zmax <- safe_max(dt$Z)
+
+  center_x <- mean(c(xmin, xmax))
+  center_y <- mean(c(ymin, ymax))
+  center_z <- mean(c(zmin, zmax))
+  scale <- max(c(xmax - xmin, ymax - ymin, zmax - zmin), na.rm = TRUE)
+  if (!is.finite(scale) || scale <= 0) {
+    scale <- 1
+  }
+
+  positions <- as.vector(rbind(
+    (sampled$X - center_x) / scale,
+    (sampled$Z - center_z) / scale,
+    -(sampled$Y - center_y) / scale
+  ))
+
+  has_intensity <- "Intensity" %in% names(sampled)
+  has_classification <- "Classification" %in% names(sampled)
+  has_hag <- "hag" %in% names(sampled)
+
+  intensity_values <- if (has_intensity) js_numeric_array(sampled$Intensity, digits = 3L) else "null"
+  classification_values <- if (has_classification) js_integer_array(sampled$Classification) else "null"
+  hag_values <- if (has_hag) js_numeric_array(sampled$hag, digits = 3L) else "null"
+  class_labels <- if (has_classification) classification_labels_js(sampled$Classification) else "{}"
+
+  metadata <- data.table::data.table(
+    field = c(
+      "Cleaned points",
+      "Sampled viewer points",
+      "Sample cap",
+      "Color modes",
+      "X range",
+      "Y range",
+      "Z range"
+    ),
+    value = c(
+      format_count(nrow(dt)),
+      format_count(length(idx)),
+      format_count(config$max_3d_points),
+      paste(
+        c(
+          "Elevation",
+          if (has_classification) "Classification" else NULL,
+          if (has_intensity) "Intensity" else NULL,
+          if (has_hag) "Height above ground" else NULL
+        ),
+        collapse = ", "
+      ),
+      paste(format_measure(xmin, 2), "to", format_measure(xmax, 2)),
+      paste(format_measure(ymin, 2), "to", format_measure(ymax, 2)),
+      paste(format_measure(zmin, 2), "to", format_measure(zmax, 2))
+    )
+  )
+
+  metadata_items <- paste0(
+    "<dl>",
+    paste0(
+      "<dt>", html_escape(metadata$field), "</dt><dd>", html_escape(metadata$value), "</dd>",
+      collapse = ""
+    ),
+    "</dl>"
+  )
+
+  html <- paste0(
+    "<!doctype html>\n",
+    "<html lang=\"en\">\n",
+    "<head>\n",
+    "<meta charset=\"utf-8\">\n",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+    "<title>Interactive 3D Point Cloud Viewer</title>\n",
+    "<style>\n",
+    "html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0f172a;color:#e5e7eb;font-family:Arial,sans-serif;}\n",
+    "#viewer{display:block;width:100vw;height:100vh;background:#0f172a;}\n",
+    ".panel{position:absolute;left:16px;top:16px;max-width:360px;background:rgba(15,23,42,.88);border:1px solid rgba(148,163,184,.35);border-radius:8px;padding:14px;box-shadow:0 12px 30px rgba(0,0,0,.28);}\n",
+    "h1{font-size:18px;margin:0 0 8px;} p{margin:8px 0;color:#cbd5e1;font-size:13px;line-height:1.4;} button{border:1px solid rgba(148,163,184,.5);background:#1e293b;color:#f8fafc;border-radius:6px;padding:7px 10px;margin:3px;cursor:pointer;} button.active{background:#2563eb;border-color:#60a5fa;} button:disabled{opacity:.45;cursor:not-allowed;} label{display:block;margin:10px 0 4px;font-size:13px;color:#cbd5e1;} input[type=range]{width:100%;} dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:10px 0 0;font-size:12px;} dt{color:#94a3b8;} dd{margin:0;color:#e5e7eb;} .hint{position:absolute;right:16px;bottom:14px;color:#cbd5e1;background:rgba(15,23,42,.78);border-radius:8px;padding:8px 10px;font-size:12px;} .legend{font-size:12px;color:#cbd5e1;margin-top:8px;max-height:130px;overflow:auto;} .legend-row{display:flex;align-items:center;gap:7px;margin:3px 0;} .swatch{width:12px;height:12px;border-radius:50%;display:inline-block;}\n",
+    "@media(max-width:720px){.panel{left:8px;right:8px;top:8px;max-width:none}.hint{display:none}}\n",
+    "</style>\n",
+    "</head>\n",
+    "<body>\n",
+    "<canvas id=\"viewer\"></canvas>\n",
+    "<section class=\"panel\">\n",
+    "<h1>Interactive 3D Point Cloud</h1>\n",
+    "<p>Drag to rotate. Use the mouse wheel or trackpad to zoom. Double-click to reset the view.</p>\n",
+    "<div id=\"modeButtons\"></div>\n",
+    "<label for=\"pointSize\">Point size</label><input id=\"pointSize\" type=\"range\" min=\"1\" max=\"6\" step=\"0.5\" value=\"2\">\n",
+    metadata_items,
+    "<div id=\"legend\" class=\"legend\"></div>\n",
+    "</section>\n",
+    "<div class=\"hint\">X = easting, vertical = elevation, depth = northing</div>\n",
+    "<script>\n",
+    "'use strict';\n",
+    "const pointData={\n",
+    "positions:new Float32Array(", js_numeric_array(positions, digits = 6L), "),\n",
+    "z:new Float32Array(", js_numeric_array(sampled$Z, digits = 3L), "),\n",
+    "intensity:", if (has_intensity) paste0("new Float32Array(", intensity_values, ")") else "null", ",\n",
+    "classification:", if (has_classification) paste0("new Int16Array(", classification_values, ")") else "null", ",\n",
+    "hag:", if (has_hag) paste0("new Float32Array(", hag_values, ")") else "null", ",\n",
+    "classLabels:", class_labels, ",\n",
+    "pointCount:", length(idx), "\n",
+    "};\n",
+    "const canvas=document.getElementById('viewer');\n",
+    "const gl=canvas.getContext('webgl',{antialias:true,preserveDrawingBuffer:false});\n",
+    "if(!gl){document.body.innerHTML='<p style=\"padding:20px\">WebGL is not available in this browser.</p>';throw new Error('WebGL unavailable');}\n",
+    "const vs='attribute vec3 aPosition;attribute vec3 aColor;uniform mat4 uMatrix;uniform float uPointSize;varying vec3 vColor;void main(){gl_Position=uMatrix*vec4(aPosition,1.0);gl_PointSize=uPointSize;vColor=aColor;}';\n",
+    "const fs='precision mediump float;varying vec3 vColor;void main(){vec2 c=gl_PointCoord-vec2(0.5);if(dot(c,c)>0.25)discard;gl_FragColor=vec4(vColor,1.0);}';\n",
+    "function shader(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;}\n",
+    "const program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vs));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(program));gl.useProgram(program);\n",
+    "const posBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,posBuffer);gl.bufferData(gl.ARRAY_BUFFER,pointData.positions,gl.STATIC_DRAW);const posLoc=gl.getAttribLocation(program,'aPosition');gl.enableVertexAttribArray(posLoc);gl.vertexAttribPointer(posLoc,3,gl.FLOAT,false,0,0);\n",
+    "const colorBuffer=gl.createBuffer();const colorLoc=gl.getAttribLocation(program,'aColor');gl.enableVertexAttribArray(colorLoc);gl.vertexAttribPointer(colorLoc,3,gl.FLOAT,false,0,0);\n",
+    "const matrixLoc=gl.getUniformLocation(program,'uMatrix');const sizeLoc=gl.getUniformLocation(program,'uPointSize');\n",
+    "const axisPositions=new Float32Array([-0.55,-0.55,0,0.55,-0.55,0, -0.55,-0.55,0,-0.55,0.55,0, -0.55,-0.55,0,-0.55,-0.55,-0.55]);\n",
+    "const axisColors=new Float32Array([0.95,0.25,0.25,0.95,0.25,0.25, 0.25,0.95,0.4,0.25,0.95,0.4, 0.35,0.6,1,0.35,0.6,1]);\n",
+    "const axisPosBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,axisPosBuffer);gl.bufferData(gl.ARRAY_BUFFER,axisPositions,gl.STATIC_DRAW);const axisColorBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,axisColorBuffer);gl.bufferData(gl.ARRAY_BUFFER,axisColors,gl.STATIC_DRAW);\n",
+    "const classPalette={0:[0.60,0.60,0.60],1:[0.62,0.65,0.70],2:[0.55,0.36,0.17],3:[0.49,0.70,0.26],4:[0.26,0.63,0.28],5:[0.10,0.37,0.13],6:[0.62,0.62,0.62],7:[0.90,0.24,0.23],8:[0.93,0.69,0.13],9:[0.12,0.47,0.71],10:[0.66,0.34,0.16],11:[0.36,0.36,0.36],12:[0.74,0.74,0.74],13:[0.58,0.40,0.74],14:[0.58,0.40,0.74],15:[0.58,0.40,0.74],16:[0.58,0.40,0.74],17:[0.50,0.50,0.50],18:[0.90,0.12,0.12]};\n",
+    "const viridis=[[0,[0.267,0.005,0.329]],[0.25,[0.230,0.322,0.545]],[0.5,[0.128,0.567,0.551]],[0.75,[0.369,0.789,0.382]],[1,[0.993,0.906,0.144]]];\n",
+    "function range(values){let lo=Infinity,hi=-Infinity;for(let i=0;i<values.length;i++){const v=values[i];if(Number.isFinite(v)){if(v<lo)lo=v;if(v>hi)hi=v;}}return [lo,hi];}\n",
+    "function ramp(t){t=Math.max(0,Math.min(1,t));for(let i=1;i<viridis.length;i++){if(t<=viridis[i][0]){const a=viridis[i-1],b=viridis[i],f=(t-a[0])/(b[0]-a[0]);return [a[1][0]+(b[1][0]-a[1][0])*f,a[1][1]+(b[1][1]-a[1][1])*f,a[1][2]+(b[1][2]-a[1][2])*f];}}return viridis[viridis.length-1][1];}\n",
+    "function fillColors(mode){const colors=new Float32Array(pointData.pointCount*3);let values=pointData.z;if(mode==='intensity')values=pointData.intensity;if(mode==='hag')values=pointData.hag;const r=values?range(values):[0,1];for(let i=0;i<pointData.pointCount;i++){let c;if(mode==='classification'&&pointData.classification){c=classPalette[pointData.classification[i]]||[0.86,0.86,0.86];}else{const denom=(r[1]-r[0])||1;c=ramp(((values?values[i]:pointData.z[i])-r[0])/denom);}colors[i*3]=c[0];colors[i*3+1]=c[1];colors[i*3+2]=c[2];}gl.bindBuffer(gl.ARRAY_BUFFER,colorBuffer);gl.bufferData(gl.ARRAY_BUFFER,colors,gl.DYNAMIC_DRAW);updateLegend(mode,r);render();}\n",
+    "function updateLegend(mode,r){const el=document.getElementById('legend');if(mode==='classification'&&pointData.classification){const used=[...new Set(Array.from(pointData.classification))].sort((a,b)=>a-b);el.innerHTML=used.map(k=>{const c=classPalette[k]||[.86,.86,.86];const rgb=c.map(v=>Math.round(v*255)).join(',');return '<div class=\"legend-row\"><span class=\"swatch\" style=\"background:rgb('+rgb+')\"></span>'+ (pointData.classLabels[k]||k) +'</div>';}).join('');}else{const label=mode==='hag'?'Height above ground':mode.charAt(0).toUpperCase()+mode.slice(1);el.innerHTML='<div>'+label+' color range: '+r[0].toFixed(2)+' to '+r[1].toFixed(2)+'</div>';}}\n",
+    "function matMul(a,b){const o=new Float32Array(16);for(let r=0;r<4;r++){for(let c=0;c<4;c++){o[c*4+r]=a[0*4+r]*b[c*4+0]+a[1*4+r]*b[c*4+1]+a[2*4+r]*b[c*4+2]+a[3*4+r]*b[c*4+3];}}return o;}\n",
+    "function perspective(fov,aspect,near,far){const f=1/Math.tan(fov/2),nf=1/(near-far);return new Float32Array([f/aspect,0,0,0,0,f,0,0,0,0,(far+near)*nf,-1,0,0,2*far*near*nf,0]);}\n",
+    "function translate(z){return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,z,1]);}\n",
+    "function rotX(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([1,0,0,0,0,c,s,0,0,-s,c,0,0,0,0,1]);}\n",
+    "function rotY(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1]);}\n",
+    "let yaw=0.65,pitch=-0.55,distance=2.4,pointSize=2,drag=false,lastX=0,lastY=0,currentMode='elevation';\n",
+    "function matrix(){const aspect=canvas.width/canvas.height;return matMul(perspective(Math.PI/4,aspect,0.01,20),matMul(translate(-distance),matMul(rotX(pitch),rotY(yaw))));}\n",
+    "function resize(){const dpr=Math.min(window.devicePixelRatio||1,2);const w=Math.floor(canvas.clientWidth*dpr),h=Math.floor(canvas.clientHeight*dpr);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;gl.viewport(0,0,w,h);}render();}\n",
+    "function render(){gl.enable(gl.DEPTH_TEST);gl.clearColor(0.06,0.09,0.16,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.uniformMatrix4fv(matrixLoc,false,matrix());gl.uniform1f(sizeLoc,pointSize*(window.devicePixelRatio||1));gl.bindBuffer(gl.ARRAY_BUFFER,posBuffer);gl.vertexAttribPointer(posLoc,3,gl.FLOAT,false,0,0);gl.bindBuffer(gl.ARRAY_BUFFER,colorBuffer);gl.vertexAttribPointer(colorLoc,3,gl.FLOAT,false,0,0);gl.drawArrays(gl.POINTS,0,pointData.pointCount);gl.uniform1f(sizeLoc,1);gl.bindBuffer(gl.ARRAY_BUFFER,axisPosBuffer);gl.vertexAttribPointer(posLoc,3,gl.FLOAT,false,0,0);gl.bindBuffer(gl.ARRAY_BUFFER,axisColorBuffer);gl.vertexAttribPointer(colorLoc,3,gl.FLOAT,false,0,0);gl.drawArrays(gl.LINES,0,6);}\n",
+    "canvas.addEventListener('pointerdown',e=>{drag=true;lastX=e.clientX;lastY=e.clientY;canvas.setPointerCapture(e.pointerId);});canvas.addEventListener('pointermove',e=>{if(!drag)return;const dx=e.clientX-lastX,dy=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;yaw+=dx*0.006;pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.006));render();});canvas.addEventListener('pointerup',()=>{drag=false;});canvas.addEventListener('wheel',e=>{e.preventDefault();distance=Math.max(0.75,Math.min(8,distance*Math.exp(e.deltaY*0.001)));render();},{passive:false});canvas.addEventListener('dblclick',()=>{yaw=0.65;pitch=-0.55;distance=2.4;render();});\n",
+    "document.getElementById('pointSize').addEventListener('input',e=>{pointSize=parseFloat(e.target.value);render();});\n",
+    "const modes=[['elevation','Elevation'], pointData.classification?['classification','Classification']:null, pointData.intensity?['intensity','Intensity']:null, pointData.hag?['hag','Height above ground']:null].filter(Boolean);const modeBox=document.getElementById('modeButtons');modes.forEach(([mode,label])=>{const b=document.createElement('button');b.textContent=label;b.addEventListener('click',()=>{currentMode=mode;document.querySelectorAll('#modeButtons button').forEach(x=>x.classList.toggle('active',x===b));fillColors(mode);});modeBox.appendChild(b);if(mode==='elevation')b.classList.add('active');});\n",
+    "window.addEventListener('resize',resize);fillColors(currentMode);resize();\n",
+    "</script>\n",
+    "</body>\n",
+    "</html>\n"
+  )
+
+  writeLines(html, viewer_path, useBytes = TRUE)
+  viewer_path
 }
 
 write_report_plots <- function(las, summaries, preprocess_log, output_dir) {
@@ -981,7 +1201,8 @@ build_summaries <- function(las, raw_header, raw_point_count, config) {
       "zmin_cleaned",
       "zmax_cleaned",
       "bbox_area_map_units2",
-      "density_points_per_map_unit2"
+      "density_points_per_map_unit2",
+      "max_3d_viewer_points"
     ),
     value = as.character(c(
       config$input_file,
@@ -1006,7 +1227,8 @@ build_summaries <- function(las, raw_header, raw_point_count, config) {
       safe_min(dt$Z),
       safe_max(dt$Z),
       bbox_area,
-      density
+      density,
+      config$max_3d_points
     ))
   )
 
@@ -1164,6 +1386,25 @@ output_file_list_to_html <- function(paths, output_dir) {
   paste0("<ul class=\"file-list\">", paste(items, collapse = ""), "</ul>")
 }
 
+interactive_viewer_section_html <- function(generated_files, output_dir) {
+  viewer_path <- generated_files[basename(generated_files) == "point_cloud_3d.html"]
+
+  if (length(viewer_path) == 0) {
+    return("")
+  }
+
+  href <- report_href(viewer_path[[1]], output_dir)
+
+  paste0(
+    "<section>",
+    "<h2>Interactive 3D Viewer</h2>",
+    "<p>Open the sampled WebGL point cloud viewer to rotate, zoom, and color the cleaned point cloud by available attributes.</p>",
+    "<p><a class=\"button-link\" href=\"", html_escape(href), "\">Open interactive 3D viewer</a></p>",
+    "<p class=\"subtle\">The viewer is sampled for browser performance. CSV summaries and report metrics still use all cleaned points.</p>",
+    "</section>\n"
+  )
+}
+
 write_html_report <- function(
   report_path,
   plot_manifest,
@@ -1252,6 +1493,8 @@ write_html_report <- function(
     "th,td{border:1px solid #d9dee7;padding:8px 10px;text-align:left;vertical-align:top;}",
     "th{background:#eef2f7;} .table-wrap{overflow-x:auto;} .table-note{color:#596273;font-size:13px;}",
     ".file-list{columns:2;line-height:1.8;} code{background:#eef2f7;padding:2px 5px;border-radius:4px;}",
+    ".button-link{display:inline-block;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;padding:10px 14px;font-weight:700;}",
+    ".button-link:hover{background:#1d4ed8;}",
     "@media(max-width:760px){header{padding:24px;} .file-list{columns:1;}}",
     sep = "\n"
   )
@@ -1281,6 +1524,7 @@ write_html_report <- function(
     "<p class=\"subtle\">Plots are generated from the cleaned point cloud. Large point clouds may be sampled for plotting speed only.</p>",
     "<div class=\"plot-grid\">", plot_manifest_to_html(plot_manifest, config$output_dir), "</div>",
     "</section>\n",
+    interactive_viewer_section_html(generated_files, config$output_dir),
     "<section>",
     "<h2>Preprocessing</h2>",
     "<p>This table shows what each cleaning step did and how many points it removed.</p>",
@@ -1383,6 +1627,12 @@ write_outputs <- function(las, raw_check, clean_check, preprocess_log, summaries
     generated_files <- c(generated_files, plot_manifest$path)
   }
 
+  message("Writing sampled interactive 3D viewer.")
+  viewer_path <- write_interactive_3d_viewer(las, config)
+  if (!is.null(viewer_path) && file.exists(viewer_path)) {
+    generated_files <- c(generated_files, viewer_path)
+  }
+
   if (isTRUE(config$write_cleaned_laz)) {
     message("Writing cleaned LAZ file and spatial index.")
     input_ext <- tools::file_ext(config$input_file)
@@ -1438,6 +1688,7 @@ run_lidar_analytics <- function(config) {
   message("Output folder: ", config$output_dir)
   message("Quick test mode: ", format_bool(config$quick_test))
   message("Write cleaned LAZ: ", format_bool(config$write_cleaned_laz))
+  message("3D viewer sample cap: ", format_count(config$max_3d_points))
   if (nzchar(config$read_filter)) {
     message("Read filter: ", config$read_filter)
   } else {
